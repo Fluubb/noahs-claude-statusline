@@ -30,18 +30,27 @@ Claude Opus 5 │ Github/my-project │ main* │ 5h:103% ·3h56m 7d:23% │ 6%(
 3. **Git Status & Branch**: Lilac-to-cyan gradient branch name with dirty worktree indicator (`*`) and ahead/behind counts (`↑N` `↓N`).
 4. **Rate Limits (5h & 7d / Quota)**: Smooth continuous 24-bit RGB gradient (Green `0%` → Yellow `55%` → Orange `80%` → Red `100%`) using piecewise linear interpolation.
    - **Reset countdown**: `used_percentage` is refreshed by the host on its own cadence and can sit unchanged for minutes at a time, which makes a busy window look frozen. Each window's `resets_at` is live on every render, so once a window reaches `80%` it also shows the time until it clears — `5h:103% ·3h56m`. Below the threshold the segment stays bare (`5h:41%`) to keep the bar quiet. Rendered as `·4d2h` / `·3h56m` / `·47m`; omitted when `resets_at` is absent or already elapsed.
-5. **Context Window Usage & Token Counts**:
+5. **Session Economics** — a single group sharing one separator, each part appearing only when it has something to say:
+   - **Prompt cache**: silent while healthy and well inside its window. The hit ratio appears below 75% (`cache:62%`), and a cold cache overrides it (`cache:cold`). The expiry countdown joins only once the remaining time drops below 25% of the cache TTL (`cache:10m` on a 1h window) — before that it is not yet news — and takes its color from how far through that final stretch it is, green as it appears through to red as it runs out. When the window lapses the next request re-sends the whole conversation at full price.
+   - **Session cost** (`$11.22`): only when billing looks per-token, judged by the absence of 5h/7d plan windows — on a subscription the figure is notional and would mislead. Where a monthly quota exists it must also pass 10%. Hidden until something has actually been spent. `STATUSLINE_SHOW_COST=1` forces it on.
+   - **Lines changed** (`+142/-38`): hidden until something actually changes.
+6. **Context Window Usage & Token Counts**:
    - Explicit percentage + token fraction (e.g. `34%(340k/1M)`)
    - **Sub-cell precision progress bar**: 1/8th cell block increments (`▏▎▍▌▋▊▉█`)
    - **Boundary background matching**: Shaded dark-gray background (`#303030`) behind the boundary partial block to eliminate terminal gap artifacts.
-6. **Smart Responsive Degradation**: Gracefully adapts to narrow terminals by prioritizing essential info without ever wrapping lines:
-   - Step 1: Hide secondary token fractions `(340k/1M)`
-   - Step 2: Hide rate limits `5h:XX% 7d:XX%`
-   - Step 3: Hide git ahead/behind `↑N ↓N` (keeps dirty `*`)
-   - Step 4: Hide parent directory
-   - Step 5: Truncate branch name (to 14, then 8 chars)
-   - Step 6: Truncate current directory (to 18, then 10 chars)
-   - Step 7: Shrink progress bar down to minimum or drop on ultra-narrow displays.
+7. **Smart Responsive Degradation**: Gracefully adapts to narrow terminals by prioritizing essential info without ever wrapping lines:
+   - Step 1: Hide lines changed `+142/-38`
+   - Step 2: Hide session cost `$11.22`
+   - Step 3: Hide the prompt-cache segment `cache:47m`
+   - Step 4: Hide secondary token fractions `(340k/1M)`
+   - Step 5: Hide rate limits `5h:XX% 7d:XX%`
+   - Step 6: Hide git ahead/behind `↑N ↓N` (keeps dirty `*`)
+   - Step 7: Hide parent directory
+   - Step 8: Truncate branch name (to 14, then 8 chars)
+   - Step 9: Truncate current directory (to 18, then 10 chars)
+   - Step 10: Shrink progress bar down to minimum or drop on ultra-narrow displays.
+
+   The bar is also the one elastic element on the line, so it yields width as segments accumulate rather than pushing the line to the edge: its ceiling starts at 60 cells and drops 6 for every optional segment still showing, to a floor of 18.
 
 ---
 
@@ -72,6 +81,8 @@ Update your `~/.claude/settings.json` (or `%USERPROFILE%\.claude\settings.json`)
   }
 }
 ```
+
+Run `test-statusline.sh` for a visual sweep, `test-countdown.sh` for the rate-limit countdown assertions, and `test-economics.sh` for the prompt-cache, cost and churn rules.
 
 > **Tip**: On Linux / macOS / WSL, you can use `statusline-linux.sh` directly without the Stop hook or PowerShell probe.
 

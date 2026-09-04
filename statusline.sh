@@ -32,6 +32,19 @@ FG_YELLOW=$'\033[93m'
 FG_CYAN=$'\033[96m'
 FG_DARK_ORANGE=$'\033[38;5;172m'
 FG_MUTED=$'\033[38;5;244m'
+FG_GREEN=$'\033[38;5;114m'
+FG_RED=$'\033[38;5;167m'
+
+# Visible cell count of a string. ${#s} is byte-based here (the statusline
+# subprocess inherits no UTF-8 locale), so "·47m" measures 5 and "↑2" measures
+# 4. Dropping UTF-8 continuation bytes leaves one byte per character, and every
+# glyph this script emits is single-width, so characters == cells. Sets a global
+# rather than echoing, to avoid a subshell fork per call.
+cells_result=0
+cells() {
+  local s=${1//[$'\200'-$'\277']/}
+  cells_result=${#s}
+}
 
 # Truncate string to max visible characters, appending '…' if cut.
 truncate_str() {
@@ -136,7 +149,16 @@ if [ -n "$input" ]; then
     @sh "day_pct_raw=\(.rate_limits.daily.used_percentage // .rateLimits.daily.usedPercentage // "")",
     @sh "five_reset_raw=\(.rate_limits.five_hour.resets_at // .rateLimits.fiveHour.resetsAt // "")",
     @sh "week_reset_raw=\(.rate_limits.seven_day.resets_at // .rateLimits.sevenDay.resetsAt // "")",
-    @sh "day_reset_raw=\(.rate_limits.daily.resets_at // .rateLimits.daily.resetsAt // "")"
+    @sh "day_reset_raw=\(.rate_limits.daily.resets_at // .rateLimits.daily.resetsAt // "")",
+    @sh "month_pct_raw=\(.rate_limits.monthly.used_percentage // .rateLimits.monthly.usedPercentage // "")",
+    @sh "has_plan_limits=\(if (.rate_limits.five_hour // .rate_limits.seven_day // .rateLimits.fiveHour // .rateLimits.sevenDay) then "1" else "" end)",
+    @sh "cache_hit_pct=\(if (.prompt_cache.hit_ratio != null) then ((.prompt_cache.hit_ratio * 100) | floor) else "" end)",
+    @sh "cache_warm_raw=\(if (.prompt_cache.warm != null) then (.prompt_cache.warm | tostring) else "" end)",
+    @sh "cache_expires_raw=\(.prompt_cache.expires_at // "")",
+    @sh "cache_ttl_raw=\(.prompt_cache.ttl // "")",
+    @sh "cost_usd_raw=\(.cost.total_cost_usd // "")",
+    @sh "lines_added_raw=\(.cost.total_lines_added // "")",
+    @sh "lines_removed_raw=\(.cost.total_lines_removed // "")"
   ' 2>/dev/null)"
 fi
 
@@ -326,27 +348,40 @@ fi
 # render, so a window at or above this threshold also shows time until it clears.
 RESET_COUNTDOWN_THRESHOLD=80
 
-# Sets reset_str to " ·4d2h" / " ·3h56m" / " ·47m", or "" when the window is
-# quiet, the timestamp is absent or malformed, or the reset has already passed.
-reset_str=""
-fmt_reset() {
-  local epoch=$1 pct=$2 secs d h m
-  reset_str=""
+# Sets dur_str to "4d2h" / "3h56m" / "47m" for an epoch in the future, or ""
+# when it is absent, malformed, or already elapsed.
+dur_str=""
+dur_secs=0
+fmt_duration() {
+  local epoch=$1 secs d h m
+  dur_str=""
+  dur_secs=0
   [ -z "$epoch" ] && return
   [[ "$epoch" =~ ^[0-9]+$ ]] || return
-  [ "$pct" -lt "$RESET_COUNTDOWN_THRESHOLD" ] && return
   secs=$(( epoch - $(date +%s) ))
   [ "$secs" -le 0 ] && return
+  dur_secs=$secs
   d=$(( secs / 86400 ))
   h=$(( secs % 86400 / 3600 ))
   m=$(( secs % 3600 / 60 ))
   if [ "$d" -gt 0 ]; then
-    reset_str=" ·${d}d${h}h"
+    dur_str="${d}d${h}h"
   elif [ "$h" -gt 0 ]; then
-    reset_str=" ·${h}h${m}m"
+    dur_str="${h}h${m}m"
   else
-    reset_str=" ·${m}m"
+    dur_str="${m}m"
   fi
+}
+
+# Sets reset_str to " ·3h56m", or "" while the window is still below the
+# threshold — a quiet window does not need a countdown.
+reset_str=""
+fmt_reset() {
+  local epoch=$1 pct=$2
+  reset_str=""
+  [ "$pct" -lt "$RESET_COUNTDOWN_THRESHOLD" ] && return
+  fmt_duration "$epoch"
+  [ -n "$dur_str" ] && reset_str=" ·${dur_str}"
 }
 rate_str=""
 plain_rate=""
@@ -373,13 +408,147 @@ if [ -n "$day_pct_raw" ] && [ -z "$week_pct_raw" ] && day_int=$(printf '%.0f' "$
   plain_rate+="1d:${day_int}%${reset_str}"
 fi
 
+# --- Session Economics: cache health, cache expiry, cost, churn ---
+# A warm, high-hit prompt cache is the ordinary case and says nothing worth
+# reading, so the hit ratio only appears once it drops below this.
+CACHE_HEALTH_THRESHOLD=75
+
+# The expiry countdown is only news near the end of the window: it appears once
+# the remaining time falls below this fraction of the cache's own TTL, and takes
+# its color from how far through that final stretch it is — green as it appears,
+# red as it runs out. When the window lapses the next request re-sends the whole
+# conversation at full price.
+CACHE_TIMER_THRESHOLD=25
+
+# Used when the payload omits prompt_cache.ttl, so the gate still has a window
+# to measure against. Matches the 1h TTL Claude Code reports today.
+CACHE_TTL_FALLBACK_SECS=3600
+
+# total_cost_usd is reported whether or not you are billed per token, and on a
+# subscription it is a notional figure that would only mislead. Plan membership
+# is read from the 5h/7d windows specifically — a monthly quota is not by itself
+# a subscription, and per-token accounts can carry one — so the segment stays
+# hidden while those windows are present, unless STATUSLINE_SHOW_COST forces it.
+# Where a monthly figure does exist, the spend only appears once it passes this,
+# keeping the line quiet early in a billing period.
+COST_MONTHLY_THRESHOLD=10
+
+cache_plain=""
+cache_color=""
+cache_sev=0
+cache_health=""
+if [ -n "$cache_hit_pct" ] && [ "$cache_hit_pct" -lt "$CACHE_HEALTH_THRESHOLD" ] 2>/dev/null; then
+  cache_health="${cache_hit_pct}%"
+  cache_sev=$(( 100 - cache_hit_pct ))
+fi
+if [ "$cache_warm_raw" = "false" ]; then
+  cache_health="cold"
+  cache_sev=100
+fi
+# TTL arrives as "1h" / "45m" / "30s"; anything unparseable falls back.
+cache_ttl_secs=$CACHE_TTL_FALLBACK_SECS
+if [[ "$cache_ttl_raw" =~ ^([0-9]+)([smhd])$ ]]; then
+  case "${BASH_REMATCH[2]}" in
+    s) cache_ttl_secs=${BASH_REMATCH[1]} ;;
+    m) cache_ttl_secs=$(( BASH_REMATCH[1] * 60 )) ;;
+    h) cache_ttl_secs=$(( BASH_REMATCH[1] * 3600 )) ;;
+    d) cache_ttl_secs=$(( BASH_REMATCH[1] * 86400 )) ;;
+  esac
+fi
+[ "$cache_ttl_secs" -le 0 ] && cache_ttl_secs=$CACHE_TTL_FALLBACK_SECS
+
+fmt_duration "$cache_expires_raw"
+cache_timer=""
+if [ -n "$dur_str" ]; then
+  cache_remain_pct=$(( dur_secs * 100 / cache_ttl_secs ))
+  if [ "$cache_remain_pct" -lt "$CACHE_TIMER_THRESHOLD" ]; then
+    cache_timer="$dur_str"
+    # Ramp across the visible stretch only: green the moment it appears at the
+    # threshold, red as it reaches zero.
+    timer_sev=$(( 100 - cache_remain_pct * 100 / CACHE_TIMER_THRESHOLD ))
+    [ "$timer_sev" -lt 0 ] && timer_sev=0
+    [ "$timer_sev" -gt 100 ] && timer_sev=100
+    [ "$timer_sev" -gt "$cache_sev" ] && cache_sev=$timer_sev
+  fi
+fi
+
+cache_body="$cache_health"
+if [ -n "$cache_timer" ]; then
+  if [ -n "$cache_body" ]; then cache_body="$cache_body $cache_timer"; else cache_body="$cache_timer"; fi
+fi
+if [ -n "$cache_body" ]; then
+  cache_plain="cache:${cache_body}"
+  grad_color "$cache_sev"
+  cache_color="${grad_result}${cache_plain}${RESET}"
+fi
+
+cost_plain=""
+cost_color=""
+if [ -n "$cost_usd_raw" ]; then
+  show_cost=0
+  if [ -n "${STATUSLINE_SHOW_COST:-}" ]; then
+    show_cost=1
+  elif [ -z "$has_plan_limits" ]; then
+    if [ -n "$month_pct_raw" ] && month_int=$(printf '%.0f' "$month_pct_raw" 2>/dev/null); then
+      [ "$month_int" -ge "$COST_MONTHLY_THRESHOLD" ] && show_cost=1
+    else
+      show_cost=1
+    fi
+  fi
+  if [ "$show_cost" -eq 1 ] && cost_plain=$(printf '$%.2f' "$cost_usd_raw" 2>/dev/null); then
+    # Nothing spent yet is not worth a segment.
+    if [ "$cost_plain" = '$0.00' ]; then
+      cost_plain=""
+    else
+      cost_color="${FG_MUTED}${cost_plain}${RESET}"
+    fi
+  else
+    cost_plain=""
+  fi
+fi
+
+lines_plain=""
+lines_color=""
+lines_added=${lines_added_raw:-0}
+lines_removed=${lines_removed_raw:-0}
+if [[ "$lines_added" =~ ^[0-9]+$ ]] && [[ "$lines_removed" =~ ^[0-9]+$ ]] &&
+   { [ "$lines_added" -gt 0 ] || [ "$lines_removed" -gt 0 ]; }; then
+  lines_plain="+${lines_added}/-${lines_removed}"
+  lines_color="${FG_GREEN}+${lines_added}${RESET}${DIM}/${RESET}${FG_RED}-${lines_removed}${RESET}"
+fi
+
+# The three share one separator, so together they cost 3 cells rather than 9.
+# Rebuilt on every measurement because the ladder switches them off one at a
+# time and the group collapses entirely once all three are gone.
+econ_plain=""
+econ_color=""
+build_econ() {
+  econ_plain=""
+  econ_color=""
+  local part p c
+  for part in cache cost lines; do
+    case $part in
+      cache) [ "$inc_cache" -eq 1 ] || continue; p=$cache_plain; c=$cache_color ;;
+      cost)  [ "$inc_cost"  -eq 1 ] || continue; p=$cost_plain;  c=$cost_color  ;;
+      lines) [ "$inc_lines" -eq 1 ] || continue; p=$lines_plain; c=$lines_color ;;
+    esac
+    [ -z "$p" ] && continue
+    if [ -n "$econ_plain" ]; then econ_plain+=" "; econ_color+=" "; fi
+    econ_plain+="$p"
+    econ_color+="$c"
+  done
+}
+
 # --- Responsive Width Sizing & Segment Layout ---
 cols=$STATUSLINE_COLS
 TARGET_MIN_BAR=8
 SEP_LEN=3
 
+# Reads the inc_* / b_max / d_max globals and writes $prefix_len, rather than
+# echoing into $( ) — build_econ below sets globals of its own, which a
+# subshell would discard.
+prefix_len=0
 prefix_visible_len() {
-  local inc_token=$1 inc_rate=$2 inc_ab=$3 inc_par=$4 b_max=$5 d_max=$6
   local n=${#model_display}
   n=$((n + SEP_LEN))
 
@@ -402,7 +571,14 @@ prefix_visible_len() {
   fi
 
   if [ "$inc_rate" -eq 1 ] && [ -n "$plain_rate" ]; then
-    n=$((n + SEP_LEN + ${#plain_rate}))
+    cells "$plain_rate"
+    n=$((n + SEP_LEN + cells_result))
+  fi
+
+  build_econ
+  if [ -n "$econ_plain" ]; then
+    cells "$econ_plain"
+    n=$((n + SEP_LEN + cells_result))
   fi
 
   n=$((n + SEP_LEN + ${#used_int} + 1))
@@ -412,11 +588,14 @@ prefix_visible_len() {
   fi
 
   n=$((n + 1))
-  echo "$n"
+  prefix_len=$n
 }
 
 inc_token=1
 inc_rate=1
+inc_cache=1
+inc_cost=1
+inc_lines=1
 inc_ab=1
 inc_par=1
 b_max=999
@@ -425,10 +604,16 @@ drop_bar=0
 budget=$((cols - 2 - TARGET_MIN_BAR))
 
 while :; do
-  cur_len=$(prefix_visible_len "$inc_token" "$inc_rate" "$inc_ab" "$inc_par" "$b_max" "$d_max")
-  [ "$cur_len" -le "$budget" ] && break
+  prefix_visible_len
+  [ "$prefix_len" -le "$budget" ] && break
 
-  if [ "$inc_token" -eq 1 ] && [ -n "$token_str" ]; then
+  if [ "$inc_lines" -eq 1 ] && [ -n "$lines_plain" ]; then
+    inc_lines=0
+  elif [ "$inc_cost" -eq 1 ] && [ -n "$cost_plain" ]; then
+    inc_cost=0
+  elif [ "$inc_cache" -eq 1 ] && [ -n "$cache_plain" ]; then
+    inc_cache=0
+  elif [ "$inc_token" -eq 1 ] && [ -n "$token_str" ]; then
     inc_token=0
   elif [ "$inc_rate" -eq 1 ] && [ -n "$plain_rate" ]; then
     inc_rate=0
@@ -479,6 +664,12 @@ if [ "$inc_rate" -eq 1 ] && [ -n "$rate_str" ]; then
   colored_prefix+="${rate_str}"
 fi
 
+build_econ
+if [ -n "$econ_color" ]; then
+  colored_prefix+=" ${sep} "
+  colored_prefix+="${econ_color}"
+fi
+
 colored_prefix+=" ${sep} "
 colored_prefix+="${bar_fill_color}${used_int}%${RESET}"
 if [ "$inc_token" -eq 1 ] && [ -n "$token_str" ]; then
@@ -487,10 +678,23 @@ fi
 colored_prefix+=" "
 
 # --- Progress Bar Rendering ---
-visible_len=$(prefix_visible_len "$inc_token" "$inc_rate" "$inc_ab" "$inc_par" "$b_max" "$d_max")
-MAX_BAR_LEN=60
+prefix_visible_len
+
+# The bar is the one elastic thing on the line, so it gives up its ceiling as
+# optional segments accumulate rather than pushing everything to the edge. With
+# nothing else on it the bar may run to 60 cells; each surviving segment takes
+# 6 off that, down to a floor of 18 where it stops being readable.
+bar_extras=0
+[ "$inc_rate"  -eq 1 ] && [ -n "$plain_rate"  ] && bar_extras=$((bar_extras + 1))
+[ "$inc_cache" -eq 1 ] && [ -n "$cache_plain" ] && bar_extras=$((bar_extras + 1))
+[ "$inc_cost"  -eq 1 ] && [ -n "$cost_plain"  ] && bar_extras=$((bar_extras + 1))
+[ "$inc_lines" -eq 1 ] && [ -n "$lines_plain" ] && bar_extras=$((bar_extras + 1))
+[ "$inc_token" -eq 1 ] && [ -n "$token_str"   ] && bar_extras=$((bar_extras + 1))
+MAX_BAR_LEN=$(( 60 - 6 * bar_extras ))
+[ "$MAX_BAR_LEN" -lt 18 ] && MAX_BAR_LEN=18
+
 bar_outer=2
-available=$((cols - visible_len - bar_outer))
+available=$((cols - prefix_len - bar_outer))
 
 if [ "$available" -lt 1 ]; then
   drop_bar=1
