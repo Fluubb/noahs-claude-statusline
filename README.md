@@ -98,7 +98,7 @@ Add the statusline hook or configure it in `.agents/hooks.json` or `~/.gemini/co
     "Stop": [
       {
         "type": "command",
-        "command": "powershell -ExecutionPolicy Bypass -File C:\\Users\\matis\\antigravity-statusline\\statusline.ps1"
+        "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\matis\\antigravity-statusline\\statusline.ps1"
       }
     ]
   }
@@ -151,7 +151,7 @@ bash /c/Users/matis/antigravity-statusline/test-statusline.sh
 ## 📂 Repository Structure
 
 - `statusline.sh` - Main Bash statusline script (Windows MSYS2, Git Bash, Linux, macOS)
-- `statusline.ps1` - Pure native PowerShell implementation (Windows PowerShell 5.1+, PowerShell 7+)
+- `statusline.ps1` - Pure native PowerShell implementation. **Requires PowerShell 7+ (`pwsh`)** - it uses the null-coalescing operator `??`, which Windows PowerShell 5.1 cannot parse, so launching it with `powershell.exe` fails outright.
 - `statusline-linux.sh` - Standalone Linux / macOS script with `/proc` pts instant inline width detection
 - `width-hook.sh` - Stop hook script to update cached terminal width on Windows
 - `width-probe.ps1` - Win32 Console API process tree walker to resolve real terminal width

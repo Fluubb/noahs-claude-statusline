@@ -27,6 +27,15 @@ process {
 end {
     $inputText = $rawInput.ToString().Trim()
 
+    # Nothing arrived through the pipeline parameter. That is the normal case
+    # when the script is launched as "pwsh -File statusline.ps1", which is how
+    # a statusLine command is wired up: -File does not bind stdin to a
+    # ValueFromPipeline parameter, so without this the payload is silently
+    # missing and the line renders its defaults. Read the stream directly.
+    if (-not $inputText -and -not [Console]::IsInputRedirected.Equals($false)) {
+        try { $inputText = [Console]::In.ReadToEnd().Trim() } catch {}
+    }
+
     # ANSI formatting constants
     $ESC = [char]27
     $RESET = "$ESC[0m"
@@ -36,6 +45,8 @@ end {
     $FG_YELLOW = "$ESC[93m"
     $FG_DARK_ORANGE = "$ESC[38;5;172m"
     $FG_MUTED = "$ESC[38;5;244m"
+    $FG_GREEN = "$ESC[38;5;114m"
+    $FG_RED = "$ESC[38;5;167m"
     $BAR_EMPTY_COLOR = "$ESC[90m"
     $BAR_EMPTY_BG = "$ESC[48;5;236m"
 
@@ -49,20 +60,48 @@ end {
     # Smooth green->yellow->orange->red gradient
     # Returns " ·4d2h" / " ·3h56m" / " ·47m" for a future Unix timestamp, or "" when
 # the window is quiet, the timestamp is absent or malformed, or it has passed.
+# Seconds until $Epoch, or 0 when it is absent, unparseable or already past.
+function Get-RemainingSecs($Epoch) {
+    if ($null -eq $Epoch) { return [long]0 }
+    [long]$e = 0
+    if (-not [long]::TryParse([string]$Epoch, [ref]$e)) { return [long]0 }
+    $secs = $e - [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($secs -le 0) { return [long]0 }
+    return [long]$secs
+}
+
+# "4d2h" / "3h56m" / "47m"
+function Format-Span([long]$Secs) {
+    if ($Secs -le 0) { return "" }
+    $d = [math]::Floor($Secs / 86400)
+    $h = [math]::Floor(($Secs % 86400) / 3600)
+    $m = [math]::Floor(($Secs % 3600) / 60)
+    if ($d -gt 0) { return "${d}d${h}h" }
+    if ($h -gt 0) { return "${h}h${m}m" }
+    return "${m}m"
+}
+
+# "1h" / "45m" / "30s" -> seconds; 0 when unparseable.
+function ConvertFrom-TtlString($Ttl) {
+    if (-not $Ttl) { return [long]0 }
+    if ([string]$Ttl -match '^(\d+)([smhd])$') {
+        $n = [long]$Matches[1]
+        switch ($Matches[2]) {
+            's' { return $n }
+            'm' { return $n * 60 }
+            'h' { return $n * 3600 }
+            'd' { return $n * 86400 }
+        }
+    }
+    return [long]0
+}
+
 function Format-ResetCountdown {
     param($Epoch, [int]$Pct, [int]$Threshold)
-    if ($null -eq $Epoch) { return "" }
     if ($Pct -lt $Threshold) { return "" }
-    [long]$e = 0
-    if (-not [long]::TryParse([string]$Epoch, [ref]$e)) { return "" }
-    $secs = $e - [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    if ($secs -le 0) { return "" }
-    $d = [math]::Floor($secs / 86400)
-    $h = [math]::Floor(($secs % 86400) / 3600)
-    $m = [math]::Floor(($secs % 3600) / 60)
-    if ($d -gt 0) { return " ·${d}d${h}h" }
-    if ($h -gt 0) { return " ·${h}h${m}m" }
-    return " ·${m}m"
+    $t = Format-Span (Get-RemainingSecs $Epoch)
+    if (-not $t) { return "" }
+    return " ·$t"
 }
 
 function Get-GradColor([double]$p) {
@@ -127,8 +166,11 @@ function Get-GradColor([double]$p) {
 
     # Format numbers (1000 -> 1k, 1000000 -> 1M)
     function Format-TokenK([long]$num) {
-        if ($num -ge 1000000) { return "$([int]($num / 1000000))M" }
-        if ($num -ge 1000) { return "$([int]($num / 1000))k" }
+        # Floor, not [int]: PowerShell division yields a double and the cast
+        # rounds, so 219726 came out "220k" where the shell scripts, which
+        # divide as integers, say "219k".
+        if ($num -ge 1000000) { return "$([long][math]::Floor($num / 1000000))M" }
+        if ($num -ge 1000) { return "$([long][math]::Floor($num / 1000))k" }
         return "$num"
     }
 
@@ -150,6 +192,15 @@ function Get-GradColor([double]$p) {
     $totalTokens = 0
     $fivePct = $null
     $weekPct = $null
+    $cacheHitRatio = $null
+    $cacheWarm = $null
+    $cacheExpires = $null
+    $cacheTtl = $null
+    $costUsd = $null
+    $linesAdded = $null
+    $linesRemoved = $null
+    $monthPct = $null
+    $hasPlanLimits = $false
 
     if ($payload) {
         $modelId = $payload.model.id ?? $payload.modelName ?? $payload.model_name ?? ""
@@ -174,6 +225,17 @@ function Get-GradColor([double]$p) {
 
         $fiveReset = $payload.rate_limits.five_hour.resets_at ?? $payload.rateLimits.fiveHour.resetsAt
         $weekReset = $payload.rate_limits.seven_day.resets_at ?? $payload.rateLimits.sevenDay.resetsAt
+
+        $cacheHitRatio = $payload.prompt_cache.hit_ratio
+        $cacheWarm     = $payload.prompt_cache.warm
+        $cacheExpires  = $payload.prompt_cache.expires_at
+        $cacheTtl      = $payload.prompt_cache.ttl
+        $costUsd       = $payload.cost.total_cost_usd
+        $linesAdded    = $payload.cost.total_lines_added
+        $linesRemoved  = $payload.cost.total_lines_removed
+        $monthPct      = $payload.rate_limits.monthly.used_percentage ?? $payload.rateLimits.monthly.usedPercentage
+        $hasPlanLimits = $null -ne ($payload.rate_limits.five_hour ?? $payload.rate_limits.seven_day ??
+                                    $payload.rateLimits.fiveHour ?? $payload.rateLimits.sevenDay)
     }
 
     if (-not $projectDir) { $projectDir = (Get-Location).Path }
@@ -329,10 +391,106 @@ function Get-GradColor([double]$p) {
     }
 
     # Width Budgeting & Degradation
+
+    # --- Session Economics: cache health, cache expiry, cost, churn ---
+    # The hit ratio only speaks up once it degrades; the expiry countdown is
+    # held back until the remaining time is under a quarter of the cache TTL,
+    # then ramps green to red across that final stretch.
+    $CACHE_HEALTH_THRESHOLD = 75
+    $CACHE_TIMER_THRESHOLD = 25
+    $CACHE_TTL_FALLBACK_SECS = 3600
+    # Spend is notional on a subscription, so it shows only when the payload
+    # carries no 5h/7d plan windows, and then only past this share of a monthly
+    # quota where one exists.
+    $COST_MONTHLY_THRESHOLD = 10
+
+    $cachePlain = ""
+    $cacheColor = ""
+    $cacheSev = 0
+    $cacheHealth = ""
+    if ($null -ne $cacheHitRatio) {
+        $hitPct = [int][math]::Floor([double]$cacheHitRatio * 100)
+        if ($hitPct -lt $CACHE_HEALTH_THRESHOLD) {
+            $cacheHealth = "$hitPct%"
+            $cacheSev = 100 - $hitPct
+        }
+    }
+    if ($null -ne $cacheWarm -and -not [bool]$cacheWarm) {
+        $cacheHealth = "cold"
+        $cacheSev = 100
+    }
+
+    $ttlSecs = ConvertFrom-TtlString $cacheTtl
+    if ($ttlSecs -le 0) { $ttlSecs = $CACHE_TTL_FALLBACK_SECS }
+    $cacheTimer = ""
+    $remainSecs = Get-RemainingSecs $cacheExpires
+    if ($remainSecs -gt 0) {
+        $remainPct = [int][math]::Floor($remainSecs * 100 / $ttlSecs)
+        if ($remainPct -lt $CACHE_TIMER_THRESHOLD) {
+            $cacheTimer = Format-Span $remainSecs
+            $timerSev = 100 - [int][math]::Floor($remainPct * 100 / $CACHE_TIMER_THRESHOLD)
+            if ($timerSev -lt 0) { $timerSev = 0 }
+            if ($timerSev -gt 100) { $timerSev = 100 }
+            if ($timerSev -gt $cacheSev) { $cacheSev = $timerSev }
+        }
+    }
+
+    $cacheBody = $cacheHealth
+    if ($cacheTimer) {
+        if ($cacheBody) { $cacheBody = "$cacheBody $cacheTimer" } else { $cacheBody = $cacheTimer }
+    }
+    if ($cacheBody) {
+        $cachePlain = "cache:$cacheBody"
+        $cacheColor = "$(Get-GradColor $cacheSev)$cachePlain$RESET"
+    }
+
+    $costPlain = ""
+    $costColor = ""
+    if ($null -ne $costUsd) {
+        $showCost = $false
+        if ($env:STATUSLINE_SHOW_COST) {
+            $showCost = $true
+        } elseif (-not $hasPlanLimits) {
+            if ($null -ne $monthPct) {
+                if ([double]$monthPct -ge $COST_MONTHLY_THRESHOLD) { $showCost = $true }
+            } else {
+                $showCost = $true
+            }
+        }
+        if ($showCost) {
+            $formatted = '$' + ([double]$costUsd).ToString("0.00", [System.Globalization.CultureInfo]::InvariantCulture)
+            if ($formatted -ne '$0.00') {
+                $costPlain = $formatted
+                $costColor = "$FG_MUTED$costPlain$RESET"
+            }
+        }
+    }
+
+    $linesPlain = ""
+    $linesColor = ""
+    $la = 0
+    $lr = 0
+    if ($null -ne $linesAdded) { $la = [int]$linesAdded }
+    if ($null -ne $linesRemoved) { $lr = [int]$linesRemoved }
+    if ($la -gt 0 -or $lr -gt 0) {
+        $linesPlain = "+$la/-$lr"
+        $linesColor = "$FG_GREEN+$la$RESET$DIM/$RESET$FG_RED-$lr$RESET"
+    }
+
+    # The three share one separator, so together they cost 3 cells not 9.
+    function Build-Econ([bool]$IncCache, [bool]$IncCost, [bool]$IncLines) {
+        $p = @()
+        $c = @()
+        if ($IncCache -and $cachePlain) { $p += $cachePlain; $c += $cacheColor }
+        if ($IncCost  -and $costPlain)  { $p += $costPlain;  $c += $costColor }
+        if ($IncLines -and $linesPlain) { $p += $linesPlain; $c += $linesColor }
+        return @{ Plain = ($p -join " "); Color = ($c -join " ") }
+    }
+
     $TARGET_MIN_BAR = 8
     $SEP_LEN = 3
 
-    function Get-PrefixLen([bool]$incToken, [bool]$incRate, [bool]$incAb, [bool]$incPar, [int]$bMax, [int]$dMax) {
+    function Get-PrefixLen([bool]$incToken, [bool]$incRate, [bool]$incCache, [bool]$incCost, [bool]$incLines, [bool]$incAb, [bool]$incPar, [int]$bMax, [int]$dMax) {
         $n = $modelDisplay.Length + $SEP_LEN
         if ($incPar -and $dirParent) { $n += ($dirParent.Length + 1) }
 
@@ -352,6 +510,9 @@ function Get-GradColor([double]$p) {
             $n += ($SEP_LEN + $plainRate.Length)
         }
 
+        $econ = Build-Econ $incCache $incCost $incLines
+        if ($econ.Plain) { $n += ($SEP_LEN + $econ.Plain.Length) }
+
         $n += ($SEP_LEN + "$usedInt".Length + 1)
         if ($incToken -and $tokenStr) {
             $n += ($tokenStr.Length + 2)
@@ -362,6 +523,9 @@ function Get-GradColor([double]$p) {
 
     $incToken = $true
     $incRate = $true
+    $incCache = $true
+    $incCost = $true
+    $incLines = $true
     $incAb = $true
     $incPar = $true
     $bMax = 999
@@ -370,10 +534,13 @@ function Get-GradColor([double]$p) {
     $budget = $cols - 2 - $TARGET_MIN_BAR
 
     while ($true) {
-        $curLen = Get-PrefixLen $incToken $incRate $incAb $incPar $bMax $dMax
+        $curLen = Get-PrefixLen $incToken $incRate $incCache $incCost $incLines $incAb $incPar $bMax $dMax
         if ($curLen -le $budget) { break }
 
-        if ($incToken -and $tokenStr) { $incToken = $false }
+        if ($incLines -and $linesPlain) { $incLines = $false }
+        elseif ($incCost -and $costPlain) { $incCost = $false }
+        elseif ($incCache -and $cachePlain) { $incCache = $false }
+        elseif ($incToken -and $tokenStr) { $incToken = $false }
         elseif ($incRate -and $plainRate) { $incRate = $false }
         elseif ($incAb -and $gitAb) { $incAb = $false }
         elseif ($incPar -and $dirParent) { $incPar = $false }
@@ -408,6 +575,9 @@ function Get-GradColor([double]$p) {
         $prefix += " $sep $rateStr"
     }
 
+    $econOut = Build-Econ $incCache $incCost $incLines
+    if ($econOut.Color) { $prefix += " $sep $($econOut.Color)" }
+
     $prefix += " $sep ${barFillColor}${usedInt}%$RESET"
     if ($incToken -and $tokenStr) {
         $prefix += "${DIM}($tokenStr)$RESET"
@@ -415,8 +585,20 @@ function Get-GradColor([double]$p) {
     $prefix += " "
 
     # Bar sizing
-    $visibleLen = Get-PrefixLen $incToken $incRate $incAb $incPar $bMax $dMax
-    $MAX_BAR_LEN = 60
+    $visibleLen = Get-PrefixLen $incToken $incRate $incCache $incCost $incLines $incAb $incPar $bMax $dMax
+
+    # The bar is the one elastic thing on the line, so it gives up its ceiling
+    # as optional segments accumulate rather than pushing everything to the
+    # edge: 60 cells with nothing else on the line, 6 less per surviving
+    # segment, floor 18.
+    $barExtras = 0
+    if ($incRate -and $plainRate) { $barExtras++ }
+    if ($incCache -and $cachePlain) { $barExtras++ }
+    if ($incCost -and $costPlain) { $barExtras++ }
+    if ($incLines -and $linesPlain) { $barExtras++ }
+    if ($incToken -and $tokenStr) { $barExtras++ }
+    $MAX_BAR_LEN = 60 - 6 * $barExtras
+    if ($MAX_BAR_LEN -lt 18) { $MAX_BAR_LEN = 18 }
     $barOuter = 2
     $available = $cols - $visibleLen - $barOuter
 
