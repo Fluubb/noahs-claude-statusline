@@ -1,5 +1,10 @@
 # Antigravity & Claude Code High-Fidelity Custom Statusline
 
+> A variant of **[noahbclarkson/noahs-claude-statusline](https://github.com/noahbclarkson/noahs-claude-statusline)**.
+> The terminal-width probe, the sub-cell progress bar, the responsive degradation ladder and the gradient engine
+> are Noah's work; this fork adds Antigravity/Gemini support, extra model palettes, the session-economics segments
+> and a native PowerShell port. Bug fixes found here are sent back upstream.
+
 A custom statusline designed for **Google Antigravity** and **Claude Code** on Windows (PowerShell, MSYS2/Git Bash, Windows Terminal), Linux, and macOS.
 
 Features real terminal-width detection, truecolor model gradients, two-tone directory rendering, live git branch and dirty tracking, 5h & 7d rate limit gradients with reset countdowns, token counters, and a sub-cell precision fractional progress bar that grows in eighths without visual gaps.
@@ -157,3 +162,11 @@ bash /c/Users/matis/antigravity-statusline/test-statusline.sh
 - `width-probe.ps1` - Win32 Console API process tree walker to resolve real terminal width
 - `test-statusline.ps1` - PowerShell test runner with diverse model/token/rate-limit fixtures
 - `test-statusline.sh` - Bash test runner
+
+---
+
+## Credits
+
+Forked from [noahbclarkson/noahs-claude-statusline](https://github.com/noahbclarkson/noahs-claude-statusline) by [@noahbclarkson](https://github.com/noahbclarkson), which solved the hard part: getting a real terminal width out of a Windows statusline subprocess that has no TTY, by walking the parent process tree and attaching to each ancestor's console. The sub-cell progress bar, the smooth gradient ramp and the narrow-terminal degradation ladder are all his design too.
+
+This fork tracks that repository as `upstream`, and fixes that are not specific to this variant are opened as pull requests there rather than kept here.
