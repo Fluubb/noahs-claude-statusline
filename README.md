@@ -1,113 +1,148 @@
-# noahs-claude-statusline
+# Antigravity & Claude Code High-Fidelity Custom Statusline
 
-A custom statusline for [Claude Code](https://claude.com/claude-code) on Windows MSYS2 bash, with smooth fractional progress bar and proper terminal-width detection.
+A custom statusline designed for **Google Antigravity** and **Claude Code** on Windows (PowerShell, MSYS2/Git Bash, Windows Terminal), Linux, and macOS.
 
-## What it shows
+Features real terminal-width detection, truecolor model gradients, two-tone directory rendering, live git branch and dirty tracking, 5h & 7d rate limit gradients with reset countdowns, token counters, and a sub-cell precision fractional progress bar that grows in eighths without visual gaps.
 
+---
+
+## 🎨 Visual Layout & Segments
+
+```text
+Gemini 3.7 Flash │ matis/antigravity-statusline │ main*↑2 │ 5h:22% 7d:14% │ 34%(340k/1M) [█████████▌░░░░░░░░░░░░░░░░░░]
 ```
-Claude Opus 4.7 (1M) │ Github/my-project │ feature-branch*↑2 │ 5h:42% 7d:18% │ 47% [██████▎░░░░░░░]
+
+```text
+Claude Opus 4.7 (1M) │ Github/my-project │ feature-branch*↑1↓2 │ 5h:42% 7d:18% │ 47%(470k/1M) [███████████▎░░░░░░░░░░░░]
+Claude Opus 5 │ Github/my-project │ main* │ 5h:103% ·3h56m 7d:23% │ 6%(58k/1M) [█▋░░░░░░░░░░░░░░░░░░░░]
 ```
 
-- **Model name** — a per-character gradient between two family-tinted colors (Opus magenta→violet, Sonnet cyan→indigo, Haiku lime→teal)
-- **Parent/current dir** — two-tone (parent in dark orange, current in bold yellow)
-- **Git branch** — purple→blue gradient, with `*` for dirty, `↑N` ahead, `↓N` behind
-- **Rate limits** — 5h and 7d windows when present, colored on the same smooth green→red gradient as the bar. Once a window reaches 80% it also shows the time until it resets (`5h:103% ·3h56m`) — `used_percentage` can sit unchanged for minutes, so the countdown is the part that stays live. Below the threshold the segment stays bare to keep the line quiet.
-- **Context %** — number plus a sub-cell-precision progress bar that grows in eighths, plus the absolute token counts (`47%(340k/1M)`) when the host sends them — the percentage says how full the window is, the pair says how big it is. The counts are the first thing dropped when the terminal gets narrow.
+### Key Components
+1. **Model Name Gradient**: Per-model family 24-bit RGB gradients:
+   - ⚡ **Gemini 3.7 Flash / Flash**: Google Blue → Amber Gold → Neon Cyan (`#4285F4` → `#FFBE28` → `#00DCB4`)
+   - 🔮 **Gemini 3.7 Pro / Ultra**: Royal Violet → Electric Blue → Sky Cyan (`#AA46FF` → `#4E8CFF` → `#28DCF0`)
+   - 🌌 **Antigravity Agent / 2.0**: Cosmic Cyan → Fuchsia Purple (`#32E1F0` → `#B446FF` → `#F53CAA`)
+   - 💎 **Claude Opus 4.7**: Neon Magenta → Indigo Violet (`#FF5FD7` → `#7364FF`)
+   - 🔷 **Claude Sonnet 3.7**: Cyan → Royal Indigo (`#46E6EB` → `#6978FF`)
+   - 🌿 **Claude Haiku**: Lime Green → Vibrant Teal (`#AFF05A` → `#37CDB9`)
+   - 🍃 **OpenAI / GPT-4 / o1 / o3 / Codex**: Mint Emerald → Aquamarine (`#10B981` → `#34D399`)
+2. **Parent & Current Directory**: Two-tone styling (parent directory in muted dark orange `#D78700`, current project in bold bright yellow).
+3. **Git Status & Branch**: Lilac-to-cyan gradient branch name with dirty worktree indicator (`*`) and ahead/behind counts (`↑N` `↓N`).
+4. **Rate Limits (5h & 7d / Quota)**: Smooth continuous 24-bit RGB gradient (Green `0%` → Yellow `55%` → Orange `80%` → Red `100%`) using piecewise linear interpolation.
+   - **Reset countdown**: `used_percentage` is refreshed by the host on its own cadence and can sit unchanged for minutes at a time, which makes a busy window look frozen. Each window's `resets_at` is live on every render, so once a window reaches `80%` it also shows the time until it clears — `5h:103% ·3h56m`. Below the threshold the segment stays bare (`5h:41%`) to keep the bar quiet. Rendered as `·4d2h` / `·3h56m` / `·47m`; omitted when `resets_at` is absent or already elapsed.
+5. **Context Window Usage & Token Counts**:
+   - Explicit percentage + token fraction (e.g. `34%(340k/1M)`)
+   - **Sub-cell precision progress bar**: 1/8th cell block increments (`▏▎▍▌▋▊▉█`)
+   - **Boundary background matching**: Shaded dark-gray background (`#303030`) behind the boundary partial block to eliminate terminal gap artifacts.
+6. **Smart Responsive Degradation**: Gracefully adapts to narrow terminals by prioritizing essential info without ever wrapping lines:
+   - Step 1: Hide secondary token fractions `(340k/1M)`
+   - Step 2: Hide rate limits `5h:XX% 7d:XX%`
+   - Step 3: Hide git ahead/behind `↑N ↓N` (keeps dirty `*`)
+   - Step 4: Hide parent directory
+   - Step 5: Truncate branch name (to 14, then 8 chars)
+   - Step 6: Truncate current directory (to 18, then 10 chars)
+   - Step 7: Shrink progress bar down to minimum or drop on ultra-narrow displays.
 
-## Why this exists
+---
 
-Claude Code's stdin JSON does not expose terminal width, and the statusline subprocess on Windows MSYS2 bash cannot get it via `tput`, `stty`, `/dev/tty`, or `$COLUMNS` — they all fail because there's no TTY in its stdio. Naive PowerShell (`$Host.UI.RawUI.WindowSize.Width`) also lies and returns 120 (a phantom default console allocated to the PowerShell subprocess).
+## 🚀 Installation & Setup
 
-This repo solves it by walking up the parent process tree from a `Stop` hook, calling `AttachConsole(parent_pid)` and `CreateFile("CONOUT$")` for each ancestor, and reading the screen-buffer info of the *last* (highest) ancestor that has a real console — which is the actual terminal the user sees.
+### Option A: Using with Claude Code
 
-## Files
+Update your `~/.claude/settings.json` (or `%USERPROFILE%\.claude\settings.json`):
 
-| File | Purpose |
-|---|---|
-| `statusline.sh`   | The statusline itself. Reads this session's cached width from `~/.claude/.statusline-cols-<session_id>`. |
-| `width-hook.sh`   | `Stop` hook entry point. Reads `session_id` from stdin, runs the probe, writes the per-session cache. |
-| `width-probe.ps1` | PowerShell probe that walks the process tree to find the real terminal width. |
-| `test-statusline.sh` | Visual harness. Renders fixed payloads so the color ramps, the sub-cell bar boundary and the narrow-terminal degradation can be checked without waiting for a real session to reach those states. |
-
-State files (written at runtime, not in the repo):
-
-- `~/.claude/.statusline-cols-<session_id>` — cached terminal width, one file per Claude Code session so concurrent instances in different-sized terminals don't overwrite each other's width
-- `~/.claude/.statusline-width-debug.log` — overwritten every probe run, useful when the chain heuristic picks the wrong ancestor
-
-## Install
-
-1. **Clone wherever you keep tools:**
-   ```bash
-   git clone <this-repo> /c/Github/noahs-claude-statusline
-   ```
-
-2. **Wire it into `~/.claude/settings.json`** (create the file if it doesn't exist):
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "bash /c/Github/noahs-claude-statusline/statusline.sh"
-     },
-     "hooks": {
-       "Stop": [
-         {
-           "matcher": "",
-           "hooks": [
-             {
-               "type": "command",
-               "command": "bash /c/Github/noahs-claude-statusline/width-hook.sh"
-             }
-           ]
-         }
-       ]
-     }
-   }
-   ```
-   Adjust the paths if you cloned elsewhere. Use MSYS2-style `/c/...` paths, not `C:\...`.
-
-3. **Restart Claude Code.** Hooks register at session start; settings changes mid-session don't pick up new hooks.
-
-4. **First render uses the 120 fallback** until the first `Stop` hook fires (after your first agent response). After that, it stays in sync — resize the terminal whenever, the bar adjusts on the next response.
-
-## Requirements
-
-- Claude Code
-- Windows 10/11 (the AttachConsole walk is Windows-specific)
-- MSYS2 bash — Git for Windows ships one that works
-- PowerShell 5.1+ (built-in)
-- `jq` and `git` on `PATH`
-
-## Linux
-
-On Linux, use `statusline-linux.sh` instead of `statusline.sh` — and skip the `Stop` hook, `width-hook.sh`, and `width-probe.ps1` entirely. The Windows width-probe layer isn't needed.
-
-The statusline subprocess still has no controlling terminal of its own (`$COLUMNS` is empty and `/dev/tty` fails), but an ancestor process — the shell or terminal emulator — still holds an fd on the real pts, whose live window size the kernel exposes. `statusline-linux.sh` walks up `/proc` (via the ppid in each `/proc/PID/stat`), checks fds `0/1/2/255` of each ancestor for a `/dev/pts/*` device, and reads its size with `stty size`. That's a few microseconds of `/proc` reads, so unlike the PowerShell probe it runs inline on every render — no hook, no per-session cache file.
-
-Wire it into `~/.claude/settings.json` with just the `statusLine` block (no `hooks`):
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "bash /path/to/noahs-claude-statusline/statusline-linux.sh"
+    "command": "bash /c/Users/matis/antigravity-statusline/statusline.sh"
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /c/Users/matis/antigravity-statusline/width-hook.sh"
+          }
+        ]
+      }
+    ]
   }
 }
 ```
 
-Requires `jq` and `git` on `PATH`. Falls back to a width of 120 if no pts-holding ancestor is found.
+> **Tip**: On Linux / macOS / WSL, you can use `statusline-linux.sh` directly without the Stop hook or PowerShell probe.
 
-## Customization
+---
 
-All knobs are at the top of `statusline.sh`:
+### Option B: Using with Antigravity / Gemini CLI (`agy`)
 
-- **Fallback width** (`STATUSLINE_COLS=120`) — used before the cache is populated, or if the probe ever fails.
-- **Model colors** — the `case "$model_id"` block, which sets each family's start/end RGB for the name gradient.
-- **Bar & rate-limit colors** — the `grad_color` anchor stops (`stops=(0 80 200 100  …)`, read as `pct R G B`). Move a stop's percentage to shift where green→yellow→orange→red lands, or change its RGB to retint.
-- **Boundary-cell BG** (`bar_empty_bg="\033[48;5;236m"`) — dark gray fill behind the partial-block character so it doesn't look like a gap. Try `233`–`238` for darker/lighter.
-- **Bar character set** — change the `partial_char` table or the `█`/`░` glyphs in the fill/empty loops.
+Add the statusline hook or configure it in `.agents/hooks.json` or `~/.gemini/config/hooks.json`:
 
-## Limitations / notes
+```json
+{
+  "statusline": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "powershell -ExecutionPolicy Bypass -File C:\\Users\\matis\\antigravity-statusline\\statusline.ps1"
+      }
+    ]
+  }
+}
+```
 
-- Statusline refresh cadence is roughly every 10 seconds in idle sessions, faster around tool boundaries. Any animation or "live" indicator looks janky — don't bother.
-- `permissionMode` (the Shift+Tab state) is not exposed to statuslines and the transcript file only logs it on session start / message boundaries, not on toggles. There's no way to render a live lock indicator.
-- The PowerShell probe takes ~200–500 ms cold-start. That's fine in a `Stop` hook (once per response) but never call it from `statusline.sh` itself.
-- If the bar ever picks a wrong width, look at `~/.claude/.statusline-width-debug.log` — it lists every ancestor walked and which had usable consoles.
+Or run via bash:
+```json
+{
+  "statusline": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "bash /c/Users/matis/antigravity-statusline/statusline.sh"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### Option C: Pure PowerShell (No Bash or JQ Required)
+
+If you're running directly in PowerShell (Windows Terminal, VS Code, pwsh):
+
+```powershell
+# Pipe JSON payload directly to the statusline
+$json | & "C:\Users\matis\antigravity-statusline\statusline.ps1"
+```
+
+---
+
+## 🧪 Testing & Verification
+
+A test harness is included to simulate various models, context sizes, and git states:
+
+```powershell
+# Run both PowerShell and Bash test harnesses
+& "C:\Users\matis\antigravity-statusline\test-statusline.ps1"
+```
+
+Or via Bash:
+```bash
+bash /c/Users/matis/antigravity-statusline/test-statusline.sh
+```
+
+---
+
+## 📂 Repository Structure
+
+- `statusline.sh` - Main Bash statusline script (Windows MSYS2, Git Bash, Linux, macOS)
+- `statusline.ps1` - Pure native PowerShell implementation (Windows PowerShell 5.1+, PowerShell 7+)
+- `statusline-linux.sh` - Standalone Linux / macOS script with `/proc` pts instant inline width detection
+- `width-hook.sh` - Stop hook script to update cached terminal width on Windows
+- `width-probe.ps1` - Win32 Console API process tree walker to resolve real terminal width
+- `test-statusline.ps1` - PowerShell test runner with diverse model/token/rate-limit fixtures
+- `test-statusline.sh` - Bash test runner

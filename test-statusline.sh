@@ -1,77 +1,69 @@
 #!/usr/bin/env bash
-# Visual test harness for statusline.sh.
-#
-# Renders the statusline against fixed payloads so the color ramps, the
-# sub-cell bar boundary and the narrow-terminal degradation can be eyeballed
-# without waiting for real sessions to drift into those states. Nothing here
-# asserts — read the output.
-#
-# The width section drives STATUSLINE_COLS the same way the real Stop hook
-# does, by writing the per-session cache file, and removes what it wrote.
+# Test harness for statusline.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATUSLINE="$SCRIPT_DIR/statusline.sh"
-CACHE_DIR="$HOME/.claude"
-SESSION="statusline-harness"
-CACHE_FILE="$CACHE_DIR/.statusline-cols-$SESSION"
 
-cleanup() { rm -f "$CACHE_FILE"; }
-trap cleanup EXIT
+echo ""
+echo -e "\033[1;36m================================================================\033[0m"
+echo -e "\033[1m   ANTIGRAVITY & CLAUDE STATUSLINE BASH TEST HARNESS\033[0m"
+echo -e "\033[1;36m================================================================\033[0m"
+echo ""
 
-heading() { printf '\n\033[1;36m%s\033[0m\n' "$1"; }
-label()   { printf '\033[2m%-34s\033[0m' "$1"; }
-
-# $1 label, $2 payload
-render() {
-  label "$1"
-  printf '%s' "$2" | bash "$STATUSLINE"
+run_test() {
+  local title="$1"
+  local json="$2"
+  echo -e "\033[1mTest: $title\033[0m"
+  printf '%s' "$json" | bash "$SCRIPT_DIR/statusline.sh"
+  echo ""
 }
 
-payload() { # $1 model_id, $2 display, $3 context %, $4 5h %, $5 7d %
-  cat <<JSON
-{
-  "model": { "id": "$1", "display_name": "$2" },
-  "workspace": { "project_dir": "$SCRIPT_DIR" },
-  "session_id": "$SESSION",
-  "context_window": { "used_percentage": $3 },
-  "rate_limits": {
-    "five_hour": { "used_percentage": $4 },
-    "seven_day": { "used_percentage": $5 }
-  }
-}
-JSON
-}
+run_test "Gemini 3.7 Flash - Clean Repo - Moderate Context" '{
+  "model": { "id": "gemini-3.7-flash", "display_name": "Gemini 3.7 Flash" },
+  "workspace": { "project_dir": "'"$SCRIPT_DIR"'" },
+  "session_id": "test-1",
+  "context_window": { "used_percentage": 34, "used_tokens": 340000, "total_tokens": 1000000 },
+  "rate_limits": { "five_hour": { "used_percentage": 22 }, "seven_day": { "used_percentage": 14 } }
+}'
 
-# A wide terminal for everything except the degradation section, so the bar
-# has room and the only variable is the payload.
-printf '120\n' > "$CACHE_FILE"
+run_test "Gemini 3.7 Pro - Heavy Context & High Rate Limits" '{
+  "model": { "id": "gemini-3.7-pro", "display_name": "Gemini 3.7 Pro" },
+  "workspace": { "project_dir": "'"$SCRIPT_DIR"'" },
+  "session_id": "test-2",
+  "context_window": { "used_percentage": 87.5, "used_tokens": 875000, "total_tokens": 1000000 },
+  "rate_limits": { "five_hour": { "used_percentage": 84 }, "seven_day": { "used_percentage": 65 } }
+}'
 
-heading "Model gradients"
-render "Opus"    "$(payload claude-opus-4-5   'Claude Opus 4.7 (1M context)' 47 42 18)"
-render "Sonnet"  "$(payload claude-sonnet-4-5 'Claude Sonnet 4.5'            47 42 18)"
-render "Haiku"   "$(payload claude-haiku-4-5  'Claude Haiku 4.5'             47 42 18)"
-render "unknown" "$(payload some-other-model  'Some Other Model'             47 42 18)"
+run_test "Antigravity Agent - 2M Token Window - Low Usage" '{
+  "model": { "id": "antigravity-agent", "display_name": "Antigravity 2.0" },
+  "workspace": { "project_dir": "'"$SCRIPT_DIR"'" },
+  "session_id": "test-3",
+  "context_window": { "used_percentage": 12, "used_tokens": 240000, "total_tokens": 2000000 },
+  "rate_limits": { "five_hour": { "used_percentage": 8 }, "seven_day": { "used_percentage": 5 } }
+}'
 
-heading "Context fill — bar color ramp and sub-cell boundary"
-for pct in 0 3 17 38 55 61 74 80 93 100; do
-  render "used_percentage=$pct" "$(payload claude-opus-4-5 'Claude Opus 4.7' "$pct" 20 10)"
-done
+run_test "Claude Opus 4.7 - Sub-cell Precision Test (47% Context)" '{
+  "model": { "id": "claude-opus-4-7", "display_name": "Claude Opus 4.7 (1M context)" },
+  "workspace": { "project_dir": "'"$SCRIPT_DIR"'" },
+  "session_id": "test-4",
+  "context_window": { "used_percentage": 47, "used_tokens": 470000, "total_tokens": 1000000 },
+  "rate_limits": { "five_hour": { "used_percentage": 42 }, "seven_day": { "used_percentage": 18 } }
+}'
 
-heading "Rate-limit color ramp"
-for pct in 5 40 60 85 99; do
-  render "5h=$pct 7d=$pct" "$(payload claude-opus-4-5 'Claude Opus 4.7' 30 "$pct" "$pct")"
-done
+run_test "Claude Sonnet 3.7 - Critical Limit Test (96% Context)" '{
+  "model": { "id": "claude-3-7-sonnet", "display_name": "Claude Sonnet 3.7" },
+  "workspace": { "project_dir": "'"$SCRIPT_DIR"'" },
+  "session_id": "test-5",
+  "context_window": { "used_percentage": 96, "used_tokens": 192000, "total_tokens": 200000 },
+  "rate_limits": { "five_hour": { "used_percentage": 92 }, "seven_day": { "used_percentage": 89 } }
+}'
 
-heading "Fractional percentages"
-render "used_percentage=47.4" "$(payload claude-opus-4-5 'Claude Opus 4.7' 47.4 42 18)"
-render "used_percentage=47.6" "$(payload claude-opus-4-5 'Claude Opus 4.7' 47.6 42 18)"
+# --- Narrow-terminal degradation ---------------------------------------------
+# Drives STATUSLINE_COLS the way the real Stop hook does, by writing the
+# per-session cache file, then removes what it wrote. Each line prints under a
+# ruler of the width it was rendered for, so an overrun is obvious.
+CACHE_FILE="$HOME/.claude/.statusline-cols-degradation-test"
+trap 'rm -f "$CACHE_FILE"' EXIT
 
-heading "Narrow terminals — degradation ladder"
-echo "Rate limits go first, then git ahead/behind, then the parent dir, then"
-echo "the branch and dir are truncated, then the bar is dropped. Each line is"
-echo "printed under a ruler of the width it was rendered for, so anything that"
-echo "overruns the ruler would have wrapped in a real terminal."
-# Ruler marking every 10th cell, so an overrun is visible at a glance.
 ruler() {
   local n=$1 i out=""
   for ((i = 1; i <= n; i++)); do
@@ -79,29 +71,24 @@ ruler() {
   done
   printf '%s' "$out"
 }
-for cols in 120 100 84 72 60 48 36 24; do
-  printf '%s
-' "$cols" > "$CACHE_FILE"
-  printf '
-[2m%s  (cols=%s)[0m
-' "$(ruler "$cols")" "$cols"
-  printf '%s' "$(payload claude-opus-4-5 'Claude Opus 4.7 (1M)' 47 42 18)" | bash "$STATUSLINE"
+
+echo ""
+echo -e "\033[1;36m================================================================\033[0m"
+echo -e "\033[1m   NARROW TERMINAL DEGRADATION LADDER\033[0m"
+echo -e "\033[1;36m================================================================\033[0m"
+echo "  Token fraction goes first, then rate limits, then git ahead/behind,"
+echo "  then the parent dir, then branch and dir truncate, then the bar drops."
+echo "  Anything past the ruler would have wrapped in a real terminal."
+
+for cols in 120 100 84 72 60 48 36; do
+  printf '%s\n' "$cols" > "$CACHE_FILE"
+  printf '\n\033[2m%s  (cols=%s)\033[0m\n' "$(ruler "$cols")" "$cols"
+  printf '%s' '{
+    "model": { "id": "gemini-3.7-flash", "display_name": "Gemini 3.7 Flash" },
+    "workspace": { "project_dir": "'"$SCRIPT_DIR"'" },
+    "session_id": "degradation-test",
+    "context_window": { "used_percentage": 47, "used_tokens": 470000, "total_tokens": 1000000 },
+    "rate_limits": { "five_hour": { "used_percentage": 42 }, "seven_day": { "used_percentage": 18 } }
+  }' | bash "$SCRIPT_DIR/statusline.sh"
 done
-echo
-
-heading "Missing fields"
-printf '120\n' > "$CACHE_FILE"
-render "no rate limits" '{
-  "model": { "id": "claude-opus-4-5", "display_name": "Claude Opus 4.7" },
-  "workspace": { "project_dir": "'"$SCRIPT_DIR"'" },
-  "session_id": "'"$SESSION"'",
-  "context_window": { "used_percentage": 47 }
-}'
-render "no workspace" '{
-  "model": { "id": "claude-opus-4-5", "display_name": "Claude Opus 4.7" },
-  "session_id": "'"$SESSION"'",
-  "context_window": { "used_percentage": 47 }
-}'
-render "empty payload" '{}'
-
-echo
+echo ""

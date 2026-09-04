@@ -1,62 +1,86 @@
 #!/usr/bin/env bash
 
-# Claude Code status line script (Linux variant)
-# Layout: model | parent/dir | branch[*↑↓] | rate-limits | context% [bar]
-#
-# Width: detected directly by walking up /proc from this process to find the
-# terminal's pseudo-terminal (pts) device and reading its winsize via
-# `stty size`. The statusline subprocess has no controlling terminal of its
-# own ($COLUMNS is empty, /dev/tty fails), but an ancestor process still holds
-# an fd on the real pts, and the kernel stores the live window size there.
-# Unlike the Windows path this is a few microseconds of /proc reads, so it runs
-# inline every render — no Stop hook or PowerShell probe needed. Falls back to
-# 120 if no pts ancestor is found.
+# ==============================================================================
+# Antigravity & Claude Code High-Fidelity Custom Statusline (Linux / macOS / WSL)
+# ==============================================================================
+# Resolves terminal window width directly by inspecting ancestor file descriptors
+# in /proc without requiring PowerShell hooks or cache files.
+# ==============================================================================
+
 STATUSLINE_COLS=120
+
+# Inline /proc pts terminal width detector
+detect_linux_cols() {
+  local pid=$$ ppid="" fd pts target
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+    for fd in 0 1 2 255; do
+      target=$(readlink "/proc/$pid/fd/$fd" 2>/dev/null)
+      if [[ "$target" =~ ^/dev/pts/[0-9]+$ ]]; then
+        local sz
+        sz=$(stty size < "$target" 2>/dev/null)
+        if [ -n "$sz" ]; then
+          local c="${sz#* }"
+          if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 20 ]; then
+            echo "$c"
+            return
+          fi
+        fi
+      fi
+    done
+    ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+    [ "$ppid" = "$pid" ] && break
+    pid="$ppid"
+  done
+  
+  if [ -n "$COLUMNS" ] && [ "$COLUMNS" -ge 20 ] 2>/dev/null; then
+    echo "$COLUMNS"
+  elif command -v tput >/dev/null 2>&1; then
+    local tc
+    tc=$(tput cols 2>/dev/null)
+    [[ "$tc" =~ ^[0-9]+$ ]] && [ "$tc" -ge 20 ] && echo "$tc"
+  fi
+}
+
+detected=$(detect_linux_cols 2>/dev/null)
+[[ "$detected" =~ ^[0-9]+$ ]] && STATUSLINE_COLS="$detected"
 
 input=$(cat)
 
-# --- ANSI color helpers ---
-# Real ESC bytes rather than "" strings, so the final printf can use %s
-# instead of %b. %b would also expand backslash escapes in the *data* — a
-# branch or directory name containing 	 renders as a tab and silently breaks
-# the visible-length math the layout depends on.
-RESET=$'[0m'
-BOLD=$'[1m'
-DIM=$'[2m'
-FG_YELLOW=$'[93m'
-FG_DARK_ORANGE=$'[38;5;172m'
-FG_MUTED=$'[38;5;244m'
+# --- ANSI Color & Formatting Constants ---
+RESET=$'\033[0m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+FG_WHITE=$'\033[97m'
+FG_YELLOW=$'\033[93m'
+FG_CYAN=$'\033[96m'
+FG_DARK_ORANGE=$'\033[38;5;172m'
+FG_MUTED=$'\033[38;5;244m'
 
-# Truncate a string to max visible chars, appending … if cut.
-# Bash substring expansion is character-based under a UTF-8 locale.
 truncate_str() {
   local s="$1" max="$2"
   if [ "${#s}" -le "$max" ]; then
     printf '%s' "$s"
   else
-    printf '%s…' "${s:0:$((max-1))}"
+    printf '%s…' "${s:0:$((max - 1))}"
   fi
 }
 
-# Smooth green→yellow→orange→red gradient for a 0-100 value. Writes a 24-bit
-# truecolor SGR sequence to $grad_result via printf -v, so there's no subshell
-# fork (costly on Windows) per call. Piecewise-linear RGB interpolation across
-# the anchor stops below; they keep the lower range green and ramp to red only
-# near the top, echoing the old discrete thresholds but continuously.
 grad_result=""
 grad_color() {
   local p=$1
+  [ -z "$p" ] && p=0
   [ "$p" -lt 0 ] && p=0
   [ "$p" -gt 100 ] && p=100
-  # anchor stops: pct R G B
+
   local stops=(0 80 200 100  55 222 205 35  80 255 140 20  100 228 55 45)
   local i p0 r0 g0 b0 p1 r1 g1 b1 span t
-  for ((i=0; i+7 < ${#stops[@]}; i+=4)); do
+  for ((i = 0; i + 7 < ${#stops[@]}; i += 4)); do
     p1=${stops[i+4]}
     [ "$p" -gt "$p1" ] && continue
     p0=${stops[i]};   r0=${stops[i+1]}; g0=${stops[i+2]}; b0=${stops[i+3]}
     r1=${stops[i+5]}; g1=${stops[i+6]}; b1=${stops[i+7]}
-    span=$((p1 - p0)); t=$((p - p0))
+    span=$((p1 - p0))
+    t=$((p - p0))
     [ "$span" -le 0 ] && span=1
     printf -v grad_result '\033[38;2;%d;%d;%dm' \
       "$(( r0 + (r1 - r0) * t / span ))" \
@@ -66,149 +90,164 @@ grad_color() {
   done
 }
 
-# Render $1 with a per-character gradient across the RGB stops given as the
-# remaining args, as r g b triples. Two stops interpolate straight from one to
-# the other; more stops split the text into equal-length segments and
-# interpolate within each, so a name can travel through several hues. Written
-# to $grad_text. The emitted SGR codes are zero-width, so this does not change
-# the visible-length math downstream.
 grad_text=""
 gradient_text() {
   local text="$1"; shift
   local stops=("$@")
-  local n=${#text} num_stops=$(( $# / 3 ))
+  local n=${#text}
+  local num_stops=$(( ${#stops[@]} / 3 ))
 
-  # Nothing to paint, or too few stops to interpolate between: pass through.
-  [ "$n" -le 0 ] && { grad_text=""; return; }
-  [ "$num_stops" -lt 2 ] && { grad_text="$text"; return; }
+  if [ "$n" -le 0 ]; then
+    grad_text=""
+    return
+  fi
 
-  local segs=$(( num_stops - 1 ))
-  local denom=$(( n > 1 ? n - 1 : 1 ))
-  local out="" i ch r g b seg seg_start seg_end span t i0 i1 r0 g0 b0 r1 g1 b1
+  if [ "$num_stops" -lt 2 ]; then
+    grad_text="$text"
+    return
+  fi
 
-  for ((i=0; i<n; i++)); do
+  local out="" i ch r g b seg_idx t span
+  local num_segments=$(( num_stops - 1 ))
+
+  for ((i = 0; i < n; i++)); do
     ch=${text:i:1}
-    # Which segment character i falls in, and how far along that segment it
-    # sits. Boundaries are computed from the same denom the character index
-    # runs on, so segments tile the string exactly with no rounding gap.
-    seg=$(( i * segs / denom ))
-    [ "$seg" -ge "$segs" ] && seg=$(( segs - 1 ))
-    seg_start=$(( seg * denom / segs ))
-    seg_end=$(( (seg + 1) * denom / segs ))
-    span=$(( seg_end - seg_start ))
-    [ "$span" -le 0 ] && span=1
-    t=$(( i - seg_start ))
-    [ "$t" -lt 0 ] && t=0
-    [ "$t" -gt "$span" ] && t=$span
+    if [ "$n" -eq 1 ]; then
+      r=${stops[0]}; g=${stops[1]}; b=${stops[2]}
+    else
+      local global_pos=$(( i * num_segments ))
+      seg_idx=$(( global_pos / (n - 1) ))
+      [ "$seg_idx" -ge "$num_segments" ] && seg_idx=$(( num_segments - 1 ))
+      
+      local seg_start=$(( seg_idx * (n - 1) / num_segments ))
+      local seg_end=$(( (seg_idx + 1) * (n - 1) / num_segments ))
+      span=$(( seg_end - seg_start ))
+      [ "$span" -le 0 ] && span=1
+      t=$(( i - seg_start ))
+      [ "$t" -lt 0 ] && t=0
+      [ "$t" -gt "$span" ] && t=$span
 
-    i0=$(( seg * 3 )); i1=$(( i0 + 3 ))
-    r0=${stops[i0]}; g0=${stops[i0+1]}; b0=${stops[i0+2]}
-    r1=${stops[i1]}; g1=${stops[i1+1]}; b1=${stops[i1+2]}
-    r=$(( r0 + (r1 - r0) * t / span ))
-    g=$(( g0 + (g1 - g0) * t / span ))
-    b=$(( b0 + (b1 - b0) * t / span ))
+      local idx0=$(( seg_idx * 3 ))
+      local idx1=$(( (seg_idx + 1) * 3 ))
+      local r0=${stops[idx0]}   g0=${stops[idx0+1]}   b0=${stops[idx0+2]}
+      local r1=${stops[idx1]}   g1=${stops[idx1+1]}   b1=${stops[idx1+2]}
+
+      r=$(( r0 + (r1 - r0) * t / span ))
+      g=$(( g0 + (g1 - g0) * t / span ))
+      b=$(( b0 + (b1 - b0) * t / span ))
+    fi
     out+=$'\033'"[38;2;${r};${g};${b}m${ch}"
   done
   grad_text="$out"
 }
 
-# --- Parse all stdin JSON fields in a single jq call (perf: fork is expensive on Windows) ---
-eval "$(printf '%s' "$input" | jq -r '
-  @sh "model_id=\(.model.id // "")",
-  @sh "model_display=\(.model.display_name // "Claude")",
-  @sh "project_dir=\(.workspace.project_dir // .cwd // "")",
-  @sh "session_id=\(.session_id // "")",
-  @sh "used_pct=\(.context_window.used_percentage // 0)",
-  @sh "used_tokens_raw=\(.context_window.used_tokens // "")",
-  @sh "total_tokens_raw=\(.context_window.total_tokens // "")",
-  @sh "five_pct_raw=\(.rate_limits.five_hour.used_percentage // "")",
-  @sh "week_pct_raw=\(.rate_limits.seven_day.used_percentage // "")",
-  @sh "five_reset_raw=\(.rate_limits.five_hour.resets_at // "")",
-  @sh "week_reset_raw=\(.rate_limits.seven_day.resets_at // "")"
-' 2>/dev/null)"
-
-# --- Terminal width: walk up /proc to the terminal's pts and read its winsize ---
-# This subprocess has no controlling terminal, but an ancestor (the shell /
-# terminal emulator) still holds an fd on the real pts, whose live window size
-# the kernel exposes via `stty size`. Ascend via field 4 (ppid) of /proc/PID/stat,
-# checking fds 0/1/2/255 of each ancestor for a /dev/pts/* device. First hit wins.
-detect_cols() {
-  local pid=$PPID depth=0 fd dev cols
-  while [ -n "$pid" ] && [ "$pid" != "0" ] && [ "$pid" != "1" ] && [ "$depth" -lt 25 ]; do
-    for fd in 0 1 2 255; do
-      dev=$(readlink "/proc/$pid/fd/$fd" 2>/dev/null) || continue
-      case "$dev" in
-        /dev/pts/*)
-          cols=$(stty size <"$dev" 2>/dev/null | awk '{print $2}')
-          [[ "$cols" =~ ^[0-9]+$ ]] && { printf '%s' "$cols"; return; }
-          ;;
-      esac
-    done
-    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
-    depth=$((depth + 1))
-  done
-}
-detected_cols=$(detect_cols)
-[[ "$detected_cols" =~ ^[0-9]+$ ]] && STATUSLINE_COLS="$detected_cols"
-
-# --- Shorten verbose model display names ---
-model_display="${model_display/ (1M context)/ (1M)}"
-
-# --- Model name: per-family endpoints for a left-to-right gradient ---
-case "$model_id" in
-  *opus*)   model_rgb=(255 95 215  115 100 255) ;;  # magenta → violet-blue
-  *sonnet*) model_rgb=(70 230 235  105 120 255) ;;  # cyan → indigo
-  *haiku*)  model_rgb=(175 240 90   55 205 185) ;;  # lime → teal
-  *)        model_rgb=(70 230 235  105 120 255) ;;
-esac
-
-# --- Project dir: parent/current ---
-if [ -n "$project_dir" ]; then
-  dir_current=$(basename "$project_dir")
-  dir_parent=$(basename "$(dirname "$project_dir")")
-  dir_display="$dir_parent/$dir_current"
-else
-  dir_display="unknown"
+if [ -n "$input" ]; then
+  eval "$(printf '%s' "$input" | jq -r '
+    @sh "model_id=\(.model.id // .modelName // .model_name // "")",
+    @sh "model_display=\(.model.display_name // .model_display // .modelName // "")",
+    @sh "project_dir=\(.workspace.project_dir // .workspacePaths[0] // .project_dir // .cwd // "")",
+    @sh "session_id=\(.session_id // .conversationId // .sessionId // "")",
+    @sh "used_pct_raw=\(.context_window.used_percentage // .contextWindow.usedPercentage // .context_percent // .used_percentage // "")",
+    @sh "used_tokens_raw=\(.context_window.used_tokens // .contextWindow.usedTokens // .used_tokens // "")",
+    @sh "total_tokens_raw=\(.context_window.total_tokens // .contextWindow.totalTokens // .total_tokens // .context_window_size // "")",
+    @sh "five_pct_raw=\(.rate_limits.five_hour.used_percentage // .rateLimits.fiveHour.usedPercentage // .five_hour_percent // "")",
+    @sh "week_pct_raw=\(.rate_limits.seven_day.used_percentage // .rateLimits.sevenDay.usedPercentage // .seven_day_percent // "")",
+    @sh "day_pct_raw=\(.rate_limits.daily.used_percentage // .rateLimits.daily.usedPercentage // "")",
+    @sh "five_reset_raw=\(.rate_limits.five_hour.resets_at // .rateLimits.fiveHour.resetsAt // "")",
+    @sh "week_reset_raw=\(.rate_limits.seven_day.resets_at // .rateLimits.sevenDay.resetsAt // "")",
+    @sh "day_reset_raw=\(.rate_limits.daily.resets_at // .rateLimits.daily.resetsAt // "")"
+  ' 2>/dev/null)"
 fi
 
-# --- Git branch + dirty indicator + ahead/behind ---
-# Fast-path: walk up the tree (fork-free) looking for .git before spawning git.
-branch=""
-git_suffix=""
-in_git_repo=""
+[ -z "$project_dir" ] && project_dir="$(pwd)"
+[ -z "$model_display" ] && [ -n "$model_id" ] && model_display="$model_id"
+[ -z "$model_display" ] && model_display="Antigravity"
+
+model_display="${model_display/ (1M context)/ (1M)}"
+model_display="${model_display/ (2M context)/ (2M)}"
+model_display="${model_display/ (High)/}"
+model_display="${model_display/ preview/}"
+model_display="${model_display/ Preview/}"
+
+model_lower=$(echo "${model_id:-$model_display}" | tr '[:upper:]' '[:lower:]')
+
+case "$model_lower" in
+  *flash*)
+    model_rgb=(66 133 244  255 190 40  0 220 180)
+    ;;
+  *pro*|*ultra*)
+    model_rgb=(170 70 255  78 140 255  40 220 240)
+    ;;
+  *gemini*)
+    model_rgb=(66 133 244  160 80 255)
+    ;;
+  *opus*)
+    model_rgb=(255 95 215  115 100 255)
+    ;;
+  *sonnet*)
+    model_rgb=(70 230 235  105 120 255)
+    ;;
+  *haiku*)
+    model_rgb=(175 240 90   55 205 185)
+    ;;
+  *gpt*|*o1*|*o3*|*codex*)
+    model_rgb=(16 185 129  52 211 153)
+    ;;
+  *antigravity*|*agy*)
+    model_rgb=(50 225 240  180 70 255  245 60 170)
+    ;;
+  *)
+    model_rgb=(70 230 235  105 120 255)
+    ;;
+esac
+
 if [ -n "$project_dir" ]; then
+  project_dir="${project_dir//\\//}"
+  dir_current=$(basename "$project_dir")
+  dir_parent_path=$(dirname "$project_dir")
+  dir_parent=$(basename "$dir_parent_path")
+  [ "$dir_parent" = "." ] || [ "$dir_parent" = "/" ] && dir_parent=""
+else
+  dir_current="unknown"
+  dir_parent=""
+fi
+
+branch=""
+git_dirty=""
+git_ab=""
+git_ab_cells=0
+in_git_repo=""
+
+if [ -n "$project_dir" ] && [ -d "$project_dir" ]; then
   check_dir="$project_dir"
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [ -z "$check_dir" ] && break
-    [ "$check_dir" = "/" ] && break
+    [ -z "$check_dir" ] || [ "$check_dir" = "/" ] && break
     if [ -e "$check_dir/.git" ]; then
       in_git_repo=1
       break
     fi
-    parent="${check_dir%/*}"
-    [ "$parent" = "$check_dir" ] && break
-    check_dir="$parent"
+    parent_dir="${check_dir%/*}"
+    [ "$parent_dir" = "$check_dir" ] && break
+    check_dir="$parent_dir"
   done
 fi
-git_dirty=""
-git_ab=""
-git_ab_cells=0   # visible-cell count of git_ab (arrows are 1 cell but 3 bytes in UTF-8)
+
 if [ -n "$in_git_repo" ] && command -v git >/dev/null 2>&1; then
   branch=$(git -C "$project_dir" --no-optional-locks branch --show-current 2>/dev/null)
-  # Detached HEAD (bisect, a checked-out tag, a rebase in flight) has no branch
-  # name; the short SHA keeps the segment useful instead of blanking it.
   if [ -z "$branch" ]; then
     branch=$(git -C "$project_dir" --no-optional-locks rev-parse --short HEAD 2>/dev/null)
   fi
+
   if [ -n "$branch" ]; then
     if [ -n "$(git -C "$project_dir" --no-optional-locks status --porcelain 2>/dev/null)" ]; then
       git_dirty="*"
     fi
-    ab=$(git -C "$project_dir" --no-optional-locks rev-list --left-right --count "@{upstream}...HEAD" 2>/dev/null)
-    if [ -n "$ab" ]; then
-      behind=$(echo "$ab" | awk '{print $1}')
-      ahead=$(echo "$ab"  | awk '{print $2}')
-      if [ "$ahead"  -gt 0 ] 2>/dev/null; then
+
+    ab_counts=$(git -C "$project_dir" --no-optional-locks rev-list --left-right --count "@{upstream}...HEAD" 2>/dev/null)
+    if [ -n "$ab_counts" ]; then
+      behind=$(echo "$ab_counts" | awk '{print $1}')
+      ahead=$(echo "$ab_counts"  | awk '{print $2}')
+      if [ "$ahead" -gt 0 ] 2>/dev/null; then
         git_ab+="↑${ahead}"
         git_ab_cells=$((git_ab_cells + 1 + ${#ahead}))
       fi
@@ -219,24 +258,22 @@ if [ -n "$in_git_repo" ] && command -v git >/dev/null 2>&1; then
     fi
   fi
 fi
-git_suffix="${git_dirty}${git_ab}"
 
-# --- Context usage ---
-used_int=$(printf '%.0f' "$used_pct" 2>/dev/null || echo 0)
-# A host reporting over 100% would make filled_eighths exceed the bar's own
-# width further down, pushing the rendered bar past $cols and wrapping the line.
-[ "$used_int" -lt 0 ] 2>/dev/null && used_int=0
-[ "$used_int" -gt 100 ] 2>/dev/null && used_int=100
+used_int=0
+if [ -n "$used_pct_raw" ]; then
+  used_int=$(printf '%.0f' "$used_pct_raw" 2>/dev/null || echo 0)
+elif [ -n "$used_tokens_raw" ] && [ -n "$total_tokens_raw" ] && [ "$total_tokens_raw" -gt 0 ] 2>/dev/null; then
+  used_int=$(( used_tokens_raw * 100 / total_tokens_raw ))
+fi
+[ "$used_int" -lt 0 ] && used_int=0
+[ "$used_int" -gt 100 ] && used_int=100
 
 grad_color "$used_int"
 bar_fill_color="$grad_result"
-bar_empty_color=$'[90m'
-bar_empty_bg=$'[48;5;236m'  # dark gray BG used behind the partial-block boundary cell
+bar_empty_color=$'\033[90m'
+bar_empty_bg=$'\033[48;5;236m'
 
-# Absolute token counts, abbreviated so the pair stays short enough to sit
-# inline: 340000 -> 340k, 1000000 -> 1M. The percentage alone says how full the
-# window is but not how big it is, which is what distinguishes a 200k window
-# from a 1M one at the same fill.
+token_str=""
 format_token_k() {
   local num=$1
   if [ "$num" -ge 1000000 ]; then
@@ -248,24 +285,21 @@ format_token_k() {
   fi
 }
 
-# Empty unless the host sends both counts, so a payload without them renders
-# exactly as before.
-token_str=""
 if [ -n "$used_tokens_raw" ] && [ -n "$total_tokens_raw" ] && [ "$total_tokens_raw" -gt 0 ] 2>/dev/null; then
-  token_str="$(format_token_k "$used_tokens_raw")/$(format_token_k "$total_tokens_raw")"
+  u_fmt=$(format_token_k "$used_tokens_raw")
+  t_fmt=$(format_token_k "$total_tokens_raw")
+  token_str="${u_fmt}/${t_fmt}"
 fi
 
-# --- Rate limits ---
+rate_str=""
+plain_rate=""
 # used_percentage is refreshed by the host on its own cadence and can sit
-# unchanged for minutes at a time, which makes a window that is already at its
-# ceiling look frozen. resets_at is the one datum that is live on every render,
-# so once a window is high enough to matter, show how long until it clears.
+# unchanged for minutes at a time. resets_at is the one datum that is live every
+# render, so a window at or above this threshold also shows time until it clears.
 RESET_COUNTDOWN_THRESHOLD=80
 
-# Sets $reset_str to " ·4d2h" / " ·3h56m" / " ·47m" for the window ending at
-# epoch $1 with usage $2, or "" when the window is still quiet, the timestamp
-# is absent or malformed, or the reset has already passed. Kept out of the
-# segment below the threshold so the common case stays terse.
+# Sets reset_str to " ·4d2h" / " ·3h56m" / " ·47m", or "" when the window is
+# quiet, the timestamp is absent or malformed, or the reset has already passed.
 reset_str=""
 fmt_reset() {
   local epoch=$1 pct=$2 secs d h m
@@ -287,92 +321,90 @@ fmt_reset() {
   fi
 }
 
-rate_str=""
-plain_rate=""
-# A non-numeric percentage fails the conversion and drops its segment, rather
-# than feeding garbage into grad_color's arithmetic or reporting a bare 0%.
 if [ -n "$five_pct_raw" ] && five_int=$(printf '%.0f' "$five_pct_raw" 2>/dev/null); then
   grad_color "$five_int"
-  five_color="$grad_result"
   fmt_reset "$five_reset_raw" "$five_int"
-  rate_str+="${five_color}5h:${five_int}%${reset_str}${RESET}"
+  rate_str+="${grad_result}5h:${five_int}%${reset_str}${RESET}"
   plain_rate+="5h:${five_int}%${reset_str}"
 fi
 if [ -n "$week_pct_raw" ] && week_int=$(printf '%.0f' "$week_pct_raw" 2>/dev/null); then
   grad_color "$week_int"
-  week_color="$grad_result"
   [ -n "$rate_str" ] && rate_str+=" "
   [ -n "$plain_rate" ] && plain_rate+=" "
   fmt_reset "$week_reset_raw" "$week_int"
-  rate_str+="${week_color}7d:${week_int}%${reset_str}${RESET}"
+  rate_str+="${grad_result}7d:${week_int}%${reset_str}${RESET}"
   plain_rate+="7d:${week_int}%${reset_str}"
 fi
+if [ -n "$day_pct_raw" ] && [ -z "$week_pct_raw" ] && day_int=$(printf '%.0f' "$day_pct_raw" 2>/dev/null); then
+  grad_color "$day_int"
+  [ -n "$rate_str" ] && rate_str+=" "
+  [ -n "$plain_rate" ] && plain_rate+=" "
+  fmt_reset "$day_reset_raw" "$day_int"
+  rate_str+="${grad_result}1d:${day_int}%${reset_str}${RESET}"
+  plain_rate+="1d:${day_int}%${reset_str}"
+fi
 
-# --- Decide which segments to keep so prefix + bar fit within $cols ---
-# Degradation order (least essential dropped first):
-#   1. token fraction after the context percentage
-#   2. rate-limits segment
-#   3. git ahead/behind suffix (keep dirty *)
-#   4. parent directory
-#   5. truncate branch to 14, then 8
-#   6. truncate current dir to 18, then 10
-#   7. drop the bar entirely
 cols=$STATUSLINE_COLS
-TARGET_BAR=8           # min bar interior cells we want
-SEP_LEN=3              # " │ " visible width
+TARGET_MIN_BAR=8
+SEP_LEN=3
 
-# Compute prefix visible length (in cells) for a given configuration.
-# All non-separator strings are assumed ASCII; truncation clamps to b_max/d_max
-# cells (truncate_str produces exactly that many visible cells via …). The
-# only multi-byte fields handled specially are the SEP_LEN constant and
-# git_ab_cells, both pre-computed in cells rather than bytes.
-# args: include_token include_rate include_ab include_parent branch_max dir_max
 prefix_visible_len() {
   local inc_token=$1 inc_rate=$2 inc_ab=$3 inc_par=$4 b_max=$5 d_max=$6
   local n=${#model_display}
   n=$((n + SEP_LEN))
-  if [ "$inc_par" = 1 ] && [ -n "$dir_parent" ]; then
-    n=$((n + ${#dir_parent} + 1))   # parent + "/"
+
+  if [ "$inc_par" -eq 1 ] && [ -n "$dir_parent" ]; then
+    n=$((n + ${#dir_parent} + 1))
   fi
+
   local d_eff_len=${#dir_current}
-  [ -z "$dir_current" ] && d_eff_len=7   # "unknown"
+  [ -z "$dir_current" ] && d_eff_len=7
   [ "$d_eff_len" -gt "$d_max" ] && d_eff_len=$d_max
   n=$((n + d_eff_len))
+
   if [ -n "$branch" ]; then
     n=$((n + SEP_LEN))
     local b_eff_len=${#branch}
     [ "$b_eff_len" -gt "$b_max" ] && b_eff_len=$b_max
     n=$((n + b_eff_len))
     n=$((n + ${#git_dirty}))
-    [ "$inc_ab" = 1 ] && n=$((n + git_ab_cells))
+    [ "$inc_ab" -eq 1 ] && n=$((n + git_ab_cells))
   fi
-  if [ "$inc_rate" = 1 ] && [ -n "$plain_rate" ]; then
+
+  if [ "$inc_rate" -eq 1 ] && [ -n "$plain_rate" ]; then
     n=$((n + SEP_LEN + ${#plain_rate}))
   fi
-  n=$((n + SEP_LEN + ${#used_int} + 1))   # " │ N%"
-  if [ "$inc_token" = 1 ] && [ -n "$token_str" ]; then
-    n=$((n + ${#token_str} + 2))          # "(used/total)"
+
+  n=$((n + SEP_LEN + ${#used_int} + 1))
+
+  if [ "$inc_token" -eq 1 ] && [ -n "$token_str" ]; then
+    n=$((n + ${#token_str} + 2))
   fi
-  n=$((n + 1))                            # trailing space before the bar
+
+  n=$((n + 1))
   echo "$n"
 }
 
-inc_token=1; inc_rate=1; inc_ab=1; inc_par=1
-b_max=999; d_max=999
+inc_token=1
+inc_rate=1
+inc_ab=1
+inc_par=1
+b_max=999
+d_max=999
 drop_bar=0
-budget=$((cols - 2 - TARGET_BAR))   # 2 for brackets
+budget=$((cols - 2 - TARGET_MIN_BAR))
 
 while :; do
-  len=$(prefix_visible_len "$inc_token" "$inc_rate" "$inc_ab" "$inc_par" "$b_max" "$d_max")
-  [ "$len" -le "$budget" ] && break
+  cur_len=$(prefix_visible_len "$inc_token" "$inc_rate" "$inc_ab" "$inc_par" "$b_max" "$d_max")
+  [ "$cur_len" -le "$budget" ] && break
 
-  if [ "$inc_token" = 1 ] && [ -n "$token_str" ]; then
+  if [ "$inc_token" -eq 1 ] && [ -n "$token_str" ]; then
     inc_token=0
-  elif [ "$inc_rate" = 1 ] && [ -n "$plain_rate" ]; then
+  elif [ "$inc_rate" -eq 1 ] && [ -n "$plain_rate" ]; then
     inc_rate=0
-  elif [ "$inc_ab" = 1 ] && [ -n "$git_ab" ]; then
+  elif [ "$inc_ab" -eq 1 ] && [ -n "$git_ab" ]; then
     inc_ab=0
-  elif [ "$inc_par" = 1 ] && [ -n "$dir_parent" ]; then
+  elif [ "$inc_par" -eq 1 ] && [ -n "$dir_parent" ]; then
     inc_par=0
   elif [ "$b_max" -gt 14 ] && [ -n "$branch" ] && [ "${#branch}" -gt 14 ]; then
     b_max=14
@@ -388,13 +420,13 @@ while :; do
   fi
 done
 
-# --- Build the colored prefix from chosen segments ---
 sep="${DIM}│${RESET}"
 
 gradient_text "$model_display" "${model_rgb[@]}"
 colored_prefix="${BOLD}${grad_text}${RESET}"
 colored_prefix+=" ${sep} "
-if [ "$inc_par" = 1 ] && [ -n "$dir_parent" ]; then
+
+if [ "$inc_par" -eq 1 ] && [ -n "$dir_parent" ]; then
   colored_prefix+="${FG_DARK_ORANGE}${dir_parent}${RESET}${DIM}/${RESET}"
 fi
 dir_show=$(truncate_str "${dir_current:-unknown}" "$d_max")
@@ -406,54 +438,43 @@ if [ -n "$branch" ]; then
   gradient_text "$branch_show" 185 105 255  85 160 255
   colored_prefix+="${grad_text}${RESET}"
   [ -n "$git_dirty" ] && colored_prefix+="${FG_YELLOW}${git_dirty}${RESET}"
-  if [ "$inc_ab" = 1 ] && [ -n "$git_ab" ]; then
+  if [ "$inc_ab" -eq 1 ] && [ -n "$git_ab" ]; then
     colored_prefix+="${FG_MUTED}${git_ab}${RESET}"
   fi
 fi
 
-if [ "$inc_rate" = 1 ] && [ -n "$rate_str" ]; then
+if [ "$inc_rate" -eq 1 ] && [ -n "$rate_str" ]; then
   colored_prefix+=" ${sep} "
   colored_prefix+="${rate_str}"
 fi
 
 colored_prefix+=" ${sep} "
 colored_prefix+="${bar_fill_color}${used_int}%${RESET}"
-if [ "$inc_token" = 1 ] && [ -n "$token_str" ]; then
+if [ "$inc_token" -eq 1 ] && [ -n "$token_str" ]; then
   colored_prefix+="${DIM}(${token_str})${RESET}"
 fi
 colored_prefix+=" "
 
-# Visible length in cells — matches what we used during the budget loop, so
-# bar sizing stays consistent (avoids the byte-vs-cell discrepancy that
-# stripping ANSI + ${#stripped} would introduce for │ separators and arrows).
 visible_len=$(prefix_visible_len "$inc_token" "$inc_rate" "$inc_ab" "$inc_par" "$b_max" "$d_max")
-
-# --- Calculate bar width ---
-# Take 95% of the free space and trim 2 more cells, keeping a clear right-edge
-# margin; cap the interior at MAX_BAR_LEN on wide terminals. Clamp into
-# [1, free space]: subtracting from the free space keeps the bar narrower than
-# the room available (so it can never wrap off the right edge), and the floor
-# stops it ever being empty or negative. With no room at all, drop the bar.
-MAX_BAR_LEN=70
-bar_outer=2  # brackets [ ]
+MAX_BAR_LEN=60
+bar_outer=2
 available=$((cols - visible_len - bar_outer))
+
 if [ "$available" -lt 1 ]; then
   drop_bar=1
   available=1
 else
-  available=$(( available * 95 / 100 - 2 ))
+  available=$(( available * 92 / 100 - 1 ))
   [ "$available" -gt "$MAX_BAR_LEN" ] && available=$MAX_BAR_LEN
   [ "$available" -lt 1 ] && available=1
 fi
 
-# Sub-cell precision: each cell = 8 eighths, so the boundary cell
-# can render a fractional block for smoother growth.
 total_eighths=$(( available * 8 ))
 filled_eighths=$(( total_eighths * used_int / 100 ))
 full_cells=$(( filled_eighths / 8 ))
 remainder=$(( filled_eighths % 8 ))
-empty=$(( available - full_cells - (remainder > 0 ? 1 : 0) ))
-[ "$empty" -lt 0 ] && empty=0
+empty_cells=$(( available - full_cells - (remainder > 0 ? 1 : 0) ))
+[ "$empty_cells" -lt 0 ] && empty_cells=0
 
 partial_char=""
 case "$remainder" in
@@ -468,22 +489,15 @@ esac
 
 bar_filled=""
 bar_empty_str=""
-for ((i=0; i<full_cells; i++)); do
-  bar_filled+="█"
-done
-for ((i=0; i<empty; i++)); do
-  bar_empty_str+="░"
-done
+for ((i = 0; i < full_cells; i++)); do bar_filled+="█"; done
+for ((i = 0; i < empty_cells; i++)); do bar_empty_str+="░"; done
 
-# Boundary cell: the partial-block glyphs (▏▎▍▌▋▊▉) only paint the LEFT
-# fraction of their cell — without a BG, the right portion shows the
-# terminal default and reads as a gap before the empty fill begins.
 partial_segment=""
 if [ -n "$partial_char" ]; then
   partial_segment="${bar_fill_color}${bar_empty_bg}${partial_char}${RESET}"
 fi
 
-if [ "$drop_bar" = 1 ]; then
+if [ "$drop_bar" -eq 1 ]; then
   bar=""
 else
   bar="${DIM}[${RESET}${bar_fill_color}${bar_filled}${RESET}${partial_segment}${bar_empty_color}${bar_empty_str}${RESET}${DIM}]${RESET}"
