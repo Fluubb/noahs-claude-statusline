@@ -165,6 +165,22 @@ bash /c/Users/matis/antigravity-statusline/test-statusline.sh
 
 ---
 
+## Branches
+
+| Branch | What it is |
+|---|---|
+| `main` | This variant. What you get by default. |
+| `upstream-main` | An untouched mirror of [upstream](https://github.com/noahbclarkson/noahs-claude-statusline)'s `main`, so the difference between the two is always one `git diff` away. |
+| `fix/*`, `feat/*`, `test/*` | Individual changes proposed back upstream, one branch per pull request. They are cut from `upstream-main`, not from this variant, so each one is a single self-contained commit against his tree. Nothing here depends on them. |
+
+To see exactly what this fork changes:
+
+```bash
+git diff upstream-main main
+```
+
+---
+
 ## Credits
 
 Forked from [noahbclarkson/noahs-claude-statusline](https://github.com/noahbclarkson/noahs-claude-statusline) by [@noahbclarkson](https://github.com/noahbclarkson), which solved the hard part: getting a real terminal width out of a Windows statusline subprocess that has no TTY, by walking the parent process tree and attaching to each ancestor's console. The sub-cell progress bar, the smooth gradient ramp and the narrow-terminal degradation ladder are all his design too.
