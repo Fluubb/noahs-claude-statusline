@@ -19,9 +19,9 @@ input=$(cat)
 RESET="\033[0m"
 BOLD="\033[1m"
 DIM="\033[2m"
-FG_WHITE="\033[97m"
 FG_YELLOW="\033[93m"
 FG_DARK_ORANGE="\033[38;5;172m"
+FG_MUTED="\033[38;5;244m"
 
 # Truncate a string to max visible chars, appending … if cut.
 # Bash substring expansion is character-based under a UTF-8 locale.
@@ -296,11 +296,11 @@ colored_prefix+="${BOLD}${FG_YELLOW}${dir_show}${RESET}"
 if [ -n "$branch" ]; then
   colored_prefix+=" ${sep} "
   branch_show=$(truncate_str "$branch" "$b_max")
-  gradient_text "$branch_show" 175 90 245  70 140 255
+  gradient_text "$branch_show" 185 105 255  85 160 255
   colored_prefix+="${grad_text}${RESET}"
-  [ -n "$git_dirty" ] && colored_prefix+="${DIM}${git_dirty}${RESET}"
+  [ -n "$git_dirty" ] && colored_prefix+="${FG_YELLOW}${git_dirty}${RESET}"
   if [ "$inc_ab" = 1 ] && [ -n "$git_ab" ]; then
-    colored_prefix+="${DIM}${git_ab}${RESET}"
+    colored_prefix+="${FG_MUTED}${git_ab}${RESET}"
   fi
 fi
 
@@ -310,7 +310,7 @@ if [ "$inc_rate" = 1 ] && [ -n "$rate_str" ]; then
 fi
 
 colored_prefix+=" ${sep} "
-colored_prefix+="${FG_WHITE}${used_int}%${RESET}"
+colored_prefix+="${bar_fill_color}${used_int}%${RESET}"
 colored_prefix+=" "
 
 # Visible length in cells — matches what we used during the budget loop, so
