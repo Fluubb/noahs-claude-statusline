@@ -154,16 +154,16 @@ function Get-GradColor([double]$p) {
     if ($payload) {
         $modelId = $payload.model.id ?? $payload.modelName ?? $payload.model_name ?? ""
         $modelDisplay = $payload.model.display_name ?? $payload.model_display ?? $payload.modelName ?? ""
-        $projectDir = $payload.workspace.project_dir ?? $payload.workspacePaths[0] ?? $payload.project_dir ?? $payload.cwd ?? ""
+        $projectDir = $payload.workspace.current_dir ?? $payload.cwd ?? $payload.workspace.project_dir ?? $payload.workspacePaths[0] ?? $payload.project_dir ?? ""
         $sessionId = $payload.session_id ?? $payload.conversationId ?? $payload.sessionId ?? ""
         
         $pctVal = $payload.context_window.used_percentage ?? $payload.contextWindow.usedPercentage ?? $payload.context_percent ?? $payload.used_percentage
         if ($null -ne $pctVal) { $usedPct = [double]$pctVal }
 
-        $uTok = $payload.context_window.used_tokens ?? $payload.contextWindow.usedTokens ?? $payload.used_tokens
+        $uTok = $payload.context_window.used_tokens ?? $payload.context_window.total_input_tokens ?? $payload.contextWindow.usedTokens ?? $payload.used_tokens
         if ($null -ne $uTok) { $usedTokens = [long]$uTok }
 
-        $tTok = $payload.context_window.total_tokens ?? $payload.contextWindow.totalTokens ?? $payload.total_tokens ?? $payload.context_window_size
+        $tTok = $payload.context_window.total_tokens ?? $payload.context_window.context_window_size ?? $payload.contextWindow.totalTokens ?? $payload.total_tokens ?? $payload.context_window_size
         if ($null -ne $tTok) { $totalTokens = [long]$tTok }
 
         $fiveVal = $payload.rate_limits.five_hour.used_percentage ?? $payload.rateLimits.fiveHour.usedPercentage ?? $payload.five_hour_percent
